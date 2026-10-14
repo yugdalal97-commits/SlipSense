@@ -48,6 +48,33 @@ TIRE_SLIP_OFFSET_R = 60  # wheelSlip[FR] --+-> left impulse trigger (max of |bot
 GRIP_LOSS_OFFSET_L = 64  # wheelSlip[RL] --+
 GRIP_LOSS_OFFSET_R = 68  # wheelSlip[RR] --+-> right impulse trigger (max of |both|)
 
+# Extra channels for the two main grip motors (event-only immersion).
+RPM_OFFSET = 20    # int32 rpms -> high-frequency motor (redline + shift thump)
+GEAR_OFFSET = 16   # int32 gear -> shift detection (N=0/R=-1, else gear number)
+VERT_G_OFFSET = 52  # float32 vertical G -> low-frequency motor (jump landings)
+LAT_G_OFFSET = 44   # float32 lateral G -> low-frequency motor (hard cornering)
+
+# Engine: linear with revs, so idle gives a faint tremor and redline screams.
+# MAX_RPM should match your car (rally cars ~7000-8500).
+MAX_RPM = 8000.0
+RPM_GAIN = 1.0
+# Redline warning: silent until revs pass REDLINE_FRAC of MAX_RPM, then ramps
+# to full at the limiter. 0.92 -> first tremor at 92%, pegged at 100%.
+REDLINE_FRAC = 0.92
+# Shift thump: full-strength burst on every gear change, this long (seconds).
+SHIFT_PULSE_SEC = 0.15
+# Landing thump: Rally reports vertical G WITHOUT gravity, so flat ground
+# reads 0.0 (not 1.0 like AC1). Only upward spikes count: gentle driving
+# stays under ~0.3, hard acceleration squat reaches ~0.8, landings spike far
+# past 1.0. 0.45 -> 0, 0.7 -> 50%, 0.95+ -> full slam.
+BUMP_THRESHOLD = 0.45
+BUMP_GAIN = 2.0
+# Hard-cornering voice (same motor, louder wins): lateral G past this means
+# the car is really leaning on the tires. Gentle bends stay under ~0.5;
+# committed rally corners spike past 1.0. 0.8 -> 0, 1.05 -> 50%, 1.3+ -> full.
+LAT_G_THRESHOLD = 0.80
+LAT_G_GAIN = 2.0
+
 # Expected value range for scaling raw physics values to 0.0-1.0 vibration.
 # If your sim outputs 0-100 instead of 0.0-1.0, set these to 100.0.
 TIRE_SLIP_MAX = 1.0
@@ -65,6 +92,10 @@ TIRE_SLIP_GAIN = 2.0
 GRIP_LOSS_THRESHOLD = 0.08
 GRIP_LOSS_GAIN = 8.0
 
+# Pause/mute: packetId (byte 0) ticks every physics update. If it stops
+# changing the sim is paused/in menus with frozen values, so mute all motors
+# after this many seconds of stale data instead of holding the last buzz.
+STALE_MUTE_SEC = 0.5
 # Every N frames, re-check the pad is still connected (handles reconnects).
 # Cheap: one counter check per frame, one light status call per N frames.
 PAD_CHECK_FRAMES = 1024
@@ -79,18 +110,27 @@ SETUP_RETRY_DELAY = 1.0
 # offsets at the top automatically remaps the fields.
 # _pack_ = 1 guarantees no compiler-inserted padding.
 #
-# NOTE: this layout assumes TIRE_SLIP_OFFSET_L <= TIRE_SLIP_OFFSET_R <=
-# GRIP_LOSS_OFFSET_L <= GRIP_LOSS_OFFSET_R (the default). If your sim orders
-# them differently, reorder the field groups smallest-offset-first.
+# NOTE: this layout assumes ascending offsets (the default). If your sim
+# orders them differently, reorder the field groups smallest-offset-first.
 # ---------------------------------------------------------------------------
 
 _FLOAT_SIZE = ctypes.sizeof(ctypes.c_float)
+_INT_SIZE = ctypes.sizeof(ctypes.c_int)
 
 
 class PhysicsBlock(ctypes.Structure):
     _pack_ = 1
     _fields_ = [
-        ("_pad0", ctypes.c_byte * TIRE_SLIP_OFFSET_L),
+        ("packet_id", ctypes.c_int),  # byte 0: ticks every physics update
+        ("_pad0pre", ctypes.c_byte * (GEAR_OFFSET - 0 - _INT_SIZE)),
+        ("gear", ctypes.c_int),  # byte GEAR_OFFSET -> shift-thump detection
+        ("_pad0a", ctypes.c_byte * (RPM_OFFSET - GEAR_OFFSET - _INT_SIZE)),
+        ("rpm", ctypes.c_int),  # byte RPM_OFFSET -> high-freq motor
+        ("_pad0b", ctypes.c_byte * (LAT_G_OFFSET - RPM_OFFSET - _INT_SIZE)),
+        ("g_lat", ctypes.c_float),  # lateral G -> low-freq motor (hard turns)
+        ("_pad0b2", ctypes.c_byte * (VERT_G_OFFSET - LAT_G_OFFSET - _FLOAT_SIZE)),
+        ("vert_g", ctypes.c_float),  # vertical G (0.0 = flat) -> low-freq motor
+        ("_pad0c", ctypes.c_byte * (TIRE_SLIP_OFFSET_L - VERT_G_OFFSET - _FLOAT_SIZE)),
         ("tire_slip_l", ctypes.c_float),  # front-left slip --+
         ("_pad01", ctypes.c_byte * (TIRE_SLIP_OFFSET_R - TIRE_SLIP_OFFSET_L - _FLOAT_SIZE)),
         ("tire_slip_r", ctypes.c_float),  # front-right slip -+-> left trigger (max of |both|)
@@ -226,17 +266,19 @@ class GameInputPad:
         except Exception:
             return False
 
-    def set_triggers(self, left: float, right: float) -> None:
+    def set_all(self, low: float, high: float, left: float, right: float) -> None:
+        self._rumble.lowFrequency = low
+        self._rumble.highFrequency = high
         self._rumble.leftTrigger = left
         self._rumble.rightTrigger = right
         _vfunc(self._dev, self._idx("rumble"), None,
                [ctypes.c_void_p])(self._dev, ctypes.byref(self._rumble))
 
     def stop(self):
-        """Zero rumble, unregister, release (cleanup path only)."""
+        """Zero all motors, unregister, release (cleanup path only)."""
         try:
             if self._dev is not None:
-                self.set_triggers(0.0, 0.0)
+                self.set_all(0.0, 0.0, 0.0, 0.0)
         except Exception:
             pass
         try:
@@ -265,6 +307,11 @@ def main() -> None:
     if SHM_SIZE < required:
         print(f"SHM_SIZE ({SHM_SIZE}) too small, need >= {required} for offsets. Exiting.")
         return
+    assert PhysicsBlock.packet_id.offset == 0, "packet_id misaligned"
+    assert PhysicsBlock.gear.offset == GEAR_OFFSET, "gear misaligned"
+    assert PhysicsBlock.rpm.offset == RPM_OFFSET, "rpm misaligned"
+    assert PhysicsBlock.vert_g.offset == VERT_G_OFFSET, "vert_g misaligned"
+    assert PhysicsBlock.g_lat.offset == LAT_G_OFFSET, "g_lat misaligned"
     assert PhysicsBlock.tire_slip_l.offset == TIRE_SLIP_OFFSET_L, "tire_slip_l misaligned"
     assert PhysicsBlock.tire_slip_r.offset == TIRE_SLIP_OFFSET_R, "tire_slip_r misaligned"
     assert PhysicsBlock.grip_loss_l.offset == GRIP_LOSS_OFFSET_L, "grip_loss_l misaligned"
@@ -290,12 +337,26 @@ def main() -> None:
 
     # Cache everything as locals so the hot loop avoids attribute lookups.
     _phys = phys
-    _set = pad.set_triggers
+    _set = pad.set_all
     _ok = pad.connected
     slip_scale = TIRE_SLIP_GAIN / (TIRE_SLIP_MAX if TIRE_SLIP_MAX != 0 else 1.0)
     grip_scale = GRIP_LOSS_GAIN / (GRIP_LOSS_MAX if GRIP_LOSS_MAX != 0 else 1.0)
+    rpm_scale = RPM_GAIN / (MAX_RPM if MAX_RPM != 0 else 8000.0)
+    red_frac = REDLINE_FRAC
+    red_span = 1.0 - REDLINE_FRAC if REDLINE_FRAC < 1.0 else 0.08
+    shift_len = SHIFT_PULSE_SEC
+    bump_thresh = BUMP_THRESHOLD
+    bump_gain = BUMP_GAIN
+    lat_thresh = LAT_G_THRESHOLD
+    lat_gain = LAT_G_GAIN
     slip_thresh = TIRE_SLIP_THRESHOLD
     grip_thresh = GRIP_LOSS_THRESHOLD
+    _mono = time.monotonic
+    last_gear = None
+    pulse_end = 0.0
+    last_pid = None
+    pid_time = 0.0
+    stale_sec = STALE_MUTE_SEC
     check_n = PAD_CHECK_FRAMES if PAD_CHECK_FRAMES > 0 else 1024
 
     try:
@@ -304,36 +365,78 @@ def main() -> None:
             # ---------------- Hot loop: no prints / no sleep / no heavy I/O ----------------
             frame = 0
             while True:
-                # Left = front lockup: loudest of the two front wheels (|.| so
-                # either slide direction or lockup polarity registers).
-                front_l = _phys.tire_slip_l
-                if front_l < 0.0:
-                    front_l = -front_l
-                front_r = _phys.tire_slip_r
-                if front_r < 0.0:
-                    front_r = -front_r
-                if front_r > front_l:
-                    front_l = front_r
-                tire_slip = (front_l - slip_thresh) * slip_scale
-                # Right = rear slide: loudest of the two rear wheels.
-                rear_l = _phys.grip_loss_l
-                if rear_l < 0.0:
-                    rear_l = -rear_l
-                rear_r = _phys.grip_loss_r
-                if rear_r < 0.0:
-                    rear_r = -rear_r
-                if rear_r > rear_l:
-                    rear_l = rear_r
-                grip_loss = (rear_l - grip_thresh) * grip_scale
-                if tire_slip < 0.0:
-                    tire_slip = 0.0
-                elif tire_slip > 1.0:
-                    tire_slip = 1.0
-                if grip_loss < 0.0:
-                    grip_loss = 0.0
-                elif grip_loss > 1.0:
-                    grip_loss = 1.0
-                _set(tire_slip, grip_loss)
+                now = _mono()
+                # Pause detect: frozen packet counter = frozen physics.
+                pid = _phys.packet_id
+                if pid != last_pid:
+                    last_pid = pid
+                    pid_time = now
+                if now - pid_time > stale_sec:
+                    _set(0.0, 0.0, 0.0, 0.0)
+                else:
+                    # Left = front lockup: loudest of the two front wheels (|.| so
+                    # either slide direction or lockup polarity registers).
+                    front_l = _phys.tire_slip_l
+                    if front_l < 0.0:
+                        front_l = -front_l
+                    front_r = _phys.tire_slip_r
+                    if front_r < 0.0:
+                        front_r = -front_r
+                    if front_r > front_l:
+                        front_l = front_r
+                    tire_slip = (front_l - slip_thresh) * slip_scale
+                    # Right = rear slide: loudest of the two rear wheels.
+                    rear_l = _phys.grip_loss_l
+                    if rear_l < 0.0:
+                        rear_l = -rear_l
+                    rear_r = _phys.grip_loss_r
+                    if rear_r < 0.0:
+                        rear_r = -rear_r
+                    if rear_r > rear_l:
+                        rear_l = rear_r
+                    grip_loss = (rear_l - grip_thresh) * grip_scale
+                    if tire_slip < 0.0:
+                        tire_slip = 0.0
+                    elif tire_slip > 1.0:
+                        tire_slip = 1.0
+                    if grip_loss < 0.0:
+                        grip_loss = 0.0
+                    elif grip_loss > 1.0:
+                        grip_loss = 1.0
+                    # Event layer (normally silent):
+                    # high-freq = redline warning + gear-shift thump,
+                    # low-freq = louder of landing slam vs. hard cornering.
+                    gear_now = _phys.gear
+                    if last_gear is None:
+                        last_gear = gear_now
+                    elif gear_now != last_gear:
+                        last_gear = gear_now
+                        pulse_end = now + shift_len
+                    engine = 0.0
+                    frac = _phys.rpm * rpm_scale
+                    if frac > red_frac:
+                        engine = (frac - red_frac) / red_span
+                        if engine > 1.0:
+                            engine = 1.0
+                    if now < pulse_end:
+                        engine = 1.0
+                    bump = _phys.vert_g - bump_thresh
+                    if bump < 0.0:
+                        bump = 0.0
+                    gforce = bump * bump_gain
+                    if gforce > 1.0:
+                        gforce = 1.0
+                    lat = _phys.g_lat
+                    if lat < 0.0:
+                        lat = -lat
+                    corner = (lat - lat_thresh) * lat_gain
+                    if corner < 0.0:
+                        corner = 0.0
+                    elif corner > 1.0:
+                        corner = 1.0
+                    if corner > gforce:
+                        gforce = corner
+                    _set(gforce, engine, tire_slip, grip_loss)
                 frame += 1
                 if frame >= check_n:
                     frame = 0
