@@ -22,7 +22,23 @@ Low-latency design:
 
 import ctypes
 import mmap
+import sys
 import time
+
+# Trigger feel presets — "tarmac" is your current perfect tune, "dirt" is
+# calmer for loose surfaces where baseline slip is always higher.
+# Switch with: SURFACE_MODE below, or: python script.py dirt
+SURFACE_MODE = "tarmac"  # "tarmac" | "dirt"
+TRIGGER_PRESETS = {
+    "tarmac": {
+        "tire_thresh": 0.25, "tire_gain": 4.0,   # left: lockup, silent in turns
+        "grip_thresh": 0.08, "grip_gain": 8.0,   # right: rear slide, MAX tune
+    },
+    "dirt": {
+        "tire_thresh": 0.35, "tire_gain": 3.0,   # left: lockup, calmer for dirt
+        "grip_thresh": 0.35, "grip_gain": 3.0,   # right: slides need real slip
+    },
+}
 
 # ---------------------------------------------------------------------------
 # Configurable settings — edit these per simulator.
@@ -48,6 +64,8 @@ TIRE_SLIP_OFFSET_R = 60  # wheelSlip[FR] --+-> left impulse trigger (max of |bot
 GRIP_LOSS_OFFSET_L = 64  # wheelSlip[RL] --+
 GRIP_LOSS_OFFSET_R = 68  # wheelSlip[RR] --+-> right impulse trigger (max of |both|)
 
+# Pedal channels (0.0-1.0) for gating trigger logic.
+BRAKE_OFFSET = 8   # float32 brake -> suppresses right (slide) trigger while braking
 # Extra channels for the two main grip motors (event-only immersion).
 RPM_OFFSET = 20    # int32 rpms -> high-frequency motor (redline + shift thump)
 GEAR_OFFSET = 16   # int32 gear -> shift detection (N=0/R=-1, else gear number)
@@ -81,16 +99,17 @@ TIRE_SLIP_MAX = 1.0
 GRIP_LOSS_MAX = 1.0
 
 # Intensity = clamp((slip - THRESHOLD) * GAIN / MAX).
-# LEFT trigger = FRONT LOCKUP channel: a locked tire reads ~1.0 slip ratio,
-# far above cornering scrub, so threshold 0.70 stays silent until a front
-# wheel actually locks. 0.7 -> 0, 0.95 -> 50%, 1.2+ -> full.
-TIRE_SLIP_THRESHOLD = 0.70
-TIRE_SLIP_GAIN = 2.0
-# RIGHT trigger = rear slide/wheelspin channel, MAX tune: threshold 0.08
-# with 8x gain. 0.08 -> 0, 0.1 -> 16%, 0.15 -> 56%, 0.2+ -> full.
-# Warning: hard driving just below the limit will buzz constantly.
-GRIP_LOSS_THRESHOLD = 0.08
-GRIP_LOSS_GAIN = 8.0
+# Active values come from TRIGGER_PRESETS[SURFACE_MODE] (see top of file).
+# Tarmac:
+#   LEFT = front lockup: 0.25 -> 0, 0.375 -> 50%, 0.5+ -> full.
+#   RIGHT = rear slide MAX: 0.08 -> 0, 0.15 -> 56%, 0.2+ -> full.
+# Dirt (calmer for loose surfaces):
+#   LEFT = 0.35 -> 0, 0.52 -> 50%, 0.68+ -> full.
+#   RIGHT = 0.35 -> 0, 0.52 -> 50%, 0.68+ -> full.
+TIRE_SLIP_THRESHOLD = TRIGGER_PRESETS[SURFACE_MODE]["tire_thresh"]
+TIRE_SLIP_GAIN = TRIGGER_PRESETS[SURFACE_MODE]["tire_gain"]
+GRIP_LOSS_THRESHOLD = TRIGGER_PRESETS[SURFACE_MODE]["grip_thresh"]
+GRIP_LOSS_GAIN = TRIGGER_PRESETS[SURFACE_MODE]["grip_gain"]
 
 # Pause/mute: packetId (byte 0) ticks every physics update. If it stops
 # changing the sim is paused/in menus with frozen values, so mute all motors
@@ -122,7 +141,9 @@ class PhysicsBlock(ctypes.Structure):
     _pack_ = 1
     _fields_ = [
         ("packet_id", ctypes.c_int),  # byte 0: ticks every physics update
-        ("_pad0pre", ctypes.c_byte * (GEAR_OFFSET - 0 - _INT_SIZE)),
+        ("_pad_gas", ctypes.c_byte * (BRAKE_OFFSET - 0 - _INT_SIZE)),
+        ("brake", ctypes.c_float),  # byte BRAKE_OFFSET: 0.0-1.0 pedal
+        ("_pad0pre", ctypes.c_byte * (GEAR_OFFSET - BRAKE_OFFSET - _FLOAT_SIZE)),
         ("gear", ctypes.c_int),  # byte GEAR_OFFSET -> shift-thump detection
         ("_pad0a", ctypes.c_byte * (RPM_OFFSET - GEAR_OFFSET - _INT_SIZE)),
         ("rpm", ctypes.c_int),  # byte RPM_OFFSET -> high-freq motor
@@ -308,6 +329,7 @@ def main() -> None:
         print(f"SHM_SIZE ({SHM_SIZE}) too small, need >= {required} for offsets. Exiting.")
         return
     assert PhysicsBlock.packet_id.offset == 0, "packet_id misaligned"
+    assert PhysicsBlock.brake.offset == BRAKE_OFFSET, "brake misaligned"
     assert PhysicsBlock.gear.offset == GEAR_OFFSET, "gear misaligned"
     assert PhysicsBlock.rpm.offset == RPM_OFFSET, "rpm misaligned"
     assert PhysicsBlock.vert_g.offset == VERT_G_OFFSET, "vert_g misaligned"
@@ -335,12 +357,28 @@ def main() -> None:
     # Zero-copy view: phys.* read game memory directly.
     phys = PhysicsBlock.from_buffer(mm)
 
+    # Resolve trigger preset: CLI arg wins ("python script.py dirt"),
+    # otherwise SURFACE_MODE from the top of the file.
+    mode = SURFACE_MODE.lower() if isinstance(SURFACE_MODE, str) else "tarmac"
+    for _arg in sys.argv[1:]:
+        _a = _arg.lower().lstrip("-")
+        if _a in TRIGGER_PRESETS:
+            mode = _a
+            break
+    if mode not in TRIGGER_PRESETS:
+        print(f"Unknown surface mode '{mode}', falling back to 'tarmac'.")
+        mode = "tarmac"
+    _preset = TRIGGER_PRESETS[mode]
+    print(f"Surface mode: {mode} "
+          f"(left { _preset['tire_thresh']}/{_preset['tire_gain']}x, "
+          f"right {_preset['grip_thresh']}/{_preset['grip_gain']}x)")
+
     # Cache everything as locals so the hot loop avoids attribute lookups.
     _phys = phys
     _set = pad.set_all
     _ok = pad.connected
-    slip_scale = TIRE_SLIP_GAIN / (TIRE_SLIP_MAX if TIRE_SLIP_MAX != 0 else 1.0)
-    grip_scale = GRIP_LOSS_GAIN / (GRIP_LOSS_MAX if GRIP_LOSS_MAX != 0 else 1.0)
+    slip_scale = _preset["tire_gain"] / (TIRE_SLIP_MAX if TIRE_SLIP_MAX != 0 else 1.0)
+    grip_scale = _preset["grip_gain"] / (GRIP_LOSS_MAX if GRIP_LOSS_MAX != 0 else 1.0)
     rpm_scale = RPM_GAIN / (MAX_RPM if MAX_RPM != 0 else 8000.0)
     red_frac = REDLINE_FRAC
     red_span = 1.0 - REDLINE_FRAC if REDLINE_FRAC < 1.0 else 0.08
@@ -349,8 +387,8 @@ def main() -> None:
     bump_gain = BUMP_GAIN
     lat_thresh = LAT_G_THRESHOLD
     lat_gain = LAT_G_GAIN
-    slip_thresh = TIRE_SLIP_THRESHOLD
-    grip_thresh = GRIP_LOSS_THRESHOLD
+    slip_thresh = _preset["tire_thresh"]
+    grip_thresh = _preset["grip_thresh"]
     _mono = time.monotonic
     last_gear = None
     pulse_end = 0.0
@@ -395,6 +433,18 @@ def main() -> None:
                     if rear_r > rear_l:
                         rear_l = rear_r
                     grip_loss = (rear_l - grip_thresh) * grip_scale
+                    # Brake gate: hard braking unloads the rears so their slip
+                    # spikes too — mute the slide channel while braking so a
+                    # front lockup is left-trigger-only. Full signal at light
+                    # pedal (<=0.05), fully muted at >=0.30. Lift-off (no pedals)
+                    # still warns.
+                    _brake = _phys.brake
+                    if _brake > 0.05:
+                        _gate = 1.0 - (_brake - 0.05) / 0.25
+                        if _gate <= 0.0:
+                            grip_loss = 0.0
+                        else:
+                            grip_loss = grip_loss * _gate
                     if tire_slip < 0.0:
                         tire_slip = 0.0
                     elif tire_slip > 1.0:
